@@ -1,0 +1,698 @@
+// FRC Prescouting - zero-dependency static app (CSV -> table/team/compare).
+// Designed for GitHub Pages: reads `config.json` and `data/prescout.csv` from same origin.
+
+const DEFAULT_CONFIG = {
+  dataPath: "./data/prescout.csv",
+  teamIdColumnCandidates: ["Team", "team", "队号", "队伍", "队伍编号", "Team Number", "TeamNumber"],
+  preferredMetricColumns: [],
+  maxCompareTeams: 4,
+  ui: { defaultView: "table" },
+};
+
+const $ = (sel) => document.querySelector(sel);
+const el = (tag, attrs = {}, children = []) => {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "class") n.className = v;
+    else if (k === "html") n.innerHTML = v;
+    else if (k.startsWith("on") && typeof v === "function") n.addEventListener(k.slice(2), v);
+    else n.setAttribute(k, String(v));
+  }
+  for (const c of children) n.append(c);
+  return n;
+};
+
+const state = {
+  config: DEFAULT_CONFIG,
+  source: { kind: "path", label: DEFAULT_CONFIG.dataPath },
+  rows: [],
+  cols: [],
+  teamCol: null,
+  numericCols: [],
+  stats: {
+    min: new Map(),
+    max: new Map(),
+    score: new Map(), // teamId -> score 0..100
+    rank: new Map(), // teamId -> 1..N
+  },
+  table: { sortCol: null, sortDir: "desc", query: "" },
+  compare: new Set(),
+};
+
+function showStatus(msg) {
+  const card = $("#statusCard");
+  const t = $("#statusText");
+  if (!msg) {
+    card.hidden = true;
+    t.textContent = "";
+    return;
+  }
+  card.hidden = false;
+  t.textContent = msg;
+}
+
+function safeParseNumber(v) {
+  if (v == null) return null;
+  const s = String(v).trim();
+  if (!s) return null;
+  // Allow "92%" style if user exported as percent.
+  if (s.endsWith("%")) {
+    const n = Number(s.slice(0, -1));
+    return Number.isFinite(n) ? n / 100 : null;
+  }
+  const n = Number(s);
+  return Number.isFinite(n) ? n : null;
+}
+
+// Minimal CSV parser with quote support.
+function parseCSV(text) {
+  const rows = [];
+  let i = 0;
+  let field = "";
+  let row = [];
+  let inQuotes = false;
+
+  const pushField = () => {
+    row.push(field);
+    field = "";
+  };
+  const pushRow = () => {
+    // Ignore trailing empty last row.
+    if (row.length === 1 && row[0] === "" && rows.length > 0) return;
+    rows.push(row);
+    row = [];
+  };
+
+  while (i < text.length) {
+    const ch = text[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        const next = text[i + 1];
+        if (next === '"') {
+          field += '"';
+          i += 2;
+          continue;
+        }
+        inQuotes = false;
+        i += 1;
+        continue;
+      }
+      field += ch;
+      i += 1;
+      continue;
+    }
+
+    if (ch === '"') {
+      inQuotes = true;
+      i += 1;
+      continue;
+    }
+    if (ch === ",") {
+      pushField();
+      i += 1;
+      continue;
+    }
+    if (ch === "\n") {
+      pushField();
+      pushRow();
+      i += 1;
+      continue;
+    }
+    if (ch === "\r") {
+      // Consume optional \r\n
+      i += 1;
+      if (text[i] === "\n") i += 1;
+      pushField();
+      pushRow();
+      continue;
+    }
+    field += ch;
+    i += 1;
+  }
+  pushField();
+  if (row.length) pushRow();
+  return rows;
+}
+
+function normalizeColName(s) {
+  return String(s ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+}
+
+function pickTeamColumn(cols, candidates) {
+  const normCols = cols.map((c) => [c, normalizeColName(c)]);
+  const want = candidates.map(normalizeColName);
+  for (const w of want) {
+    const found = normCols.find(([, n]) => n === w);
+    if (found) return found[0];
+  }
+  // fallback: any column that looks like team number
+  const fuzzy = normCols.find(([, n]) => n.includes("team") && n.includes("number"));
+  return fuzzy ? fuzzy[0] : cols[0] ?? null;
+}
+
+function inferNumericColumns(rows, cols) {
+  const numeric = [];
+  for (const c of cols) {
+    let ok = 0;
+    let total = 0;
+    for (const r of rows) {
+      const v = r[c];
+      if (v == null) continue;
+      const s = String(v).trim();
+      if (!s) continue;
+      total += 1;
+      const n = safeParseNumber(s);
+      if (n != null) ok += 1;
+    }
+    if (total === 0) continue;
+    if (ok / total >= 0.7) numeric.push(c);
+  }
+  return numeric;
+}
+
+function computeStats() {
+  state.stats.min.clear();
+  state.stats.max.clear();
+  state.stats.score.clear();
+  state.stats.rank.clear();
+
+  for (const c of state.numericCols) {
+    let min = Infinity;
+    let max = -Infinity;
+    for (const r of state.rows) {
+      const n = safeParseNumber(r[c]);
+      if (n == null) continue;
+      if (n < min) min = n;
+      if (n > max) max = n;
+    }
+    if (min === Infinity || max === -Infinity) continue;
+    state.stats.min.set(c, min);
+    state.stats.max.set(c, max);
+  }
+
+  const metricCols =
+    (state.config.preferredMetricColumns || []).filter((c) => state.numericCols.includes(c)) ||
+    [];
+  const colsForScore = metricCols.length ? metricCols : state.numericCols;
+
+  for (const r of state.rows) {
+    const team = String(r[state.teamCol] ?? "").trim();
+    if (!team) continue;
+    let sum = 0;
+    let cnt = 0;
+    for (const c of colsForScore) {
+      const n = safeParseNumber(r[c]);
+      if (n == null) continue;
+      const min = state.stats.min.get(c);
+      const max = state.stats.max.get(c);
+      if (min == null || max == null) continue;
+      const t = max === min ? 1 : (n - min) / (max - min);
+      sum += Math.max(0, Math.min(1, t));
+      cnt += 1;
+    }
+    const score01 = cnt ? sum / cnt : 0;
+    state.stats.score.set(team, Math.round(score01 * 1000) / 10); // one decimal
+  }
+
+  const ranked = [...state.stats.score.entries()].sort((a, b) => b[1] - a[1]);
+  ranked.forEach(([team], idx) => state.stats.rank.set(team, idx + 1));
+}
+
+function escapeHtml(s) {
+  return String(s ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
+}
+
+function parseHash() {
+  const h = (location.hash || "").replace(/^#/, "");
+  if (!h) return { view: state.config.ui?.defaultView || "table", team: null, compare: [] };
+
+  const [head, rest] = h.split("=", 2);
+  const view = head.trim();
+  if (view === "team") return { view, team: rest ? decodeURIComponent(rest) : null, compare: [] };
+  if (view === "compare") {
+    const list = (rest || "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    return { view, team: null, compare: list };
+  }
+  if (["table", "import"].includes(view)) return { view, team: null, compare: [] };
+  return { view: "table", team: null, compare: [] };
+}
+
+function setActiveNav(view) {
+  for (const a of document.querySelectorAll(".nav-link")) {
+    const href = a.getAttribute("href") || "";
+    const active = href === `#${view}` || href === `#${view}`.replace("=null", "");
+    a.classList.toggle("active", active);
+  }
+}
+
+function showView(viewId) {
+  $("#viewTable").hidden = viewId !== "table";
+  $("#viewTeam").hidden = viewId !== "team";
+  $("#viewCompare").hidden = viewId !== "compare";
+  $("#viewImport").hidden = viewId !== "import";
+  setActiveNav(viewId);
+}
+
+function renderTable() {
+  const table = $("#teamsTable");
+  table.innerHTML = "";
+  const teamCol = state.teamCol;
+  if (!teamCol) return;
+
+  const q = (state.table.query || "").trim().toLowerCase();
+  const metricCols =
+    (state.config.preferredMetricColumns || []).filter((c) => state.cols.includes(c)) || [];
+  const showCols = [
+    teamCol,
+    "Score",
+    "Rank",
+    ...(metricCols.length ? metricCols : state.numericCols.slice(0, 8)),
+  ];
+
+  const rows = state.rows
+    .filter((r) => {
+      if (!q) return true;
+      const team = String(r[teamCol] ?? "").toLowerCase();
+      if (team.includes(q)) return true;
+      // search any string column (small data)
+      for (const c of state.cols) {
+        const v = r[c];
+        if (v == null) continue;
+        const s = String(v).toLowerCase();
+        if (s.includes(q)) return true;
+      }
+      return false;
+    })
+    .map((r) => {
+      const team = String(r[teamCol] ?? "").trim();
+      return { ...r, Score: state.stats.score.get(team) ?? "", Rank: state.stats.rank.get(team) ?? "" };
+    });
+
+  const sortCol = state.table.sortCol;
+  const dir = state.table.sortDir;
+  if (sortCol) {
+    rows.sort((a, b) => {
+      const av = a[sortCol];
+      const bv = b[sortCol];
+      const an = safeParseNumber(av);
+      const bn = safeParseNumber(bv);
+      if (an != null && bn != null) return dir === "asc" ? an - bn : bn - an;
+      return dir === "asc"
+        ? String(av ?? "").localeCompare(String(bv ?? ""))
+        : String(bv ?? "").localeCompare(String(av ?? ""));
+    });
+  }
+
+  const thead = el("thead");
+  const trh = el("tr");
+  for (const c of showCols) {
+    const th = el("th", {
+      html: escapeHtml(c) + (state.table.sortCol === c ? (state.table.sortDir === "asc" ? " ▲" : " ▼") : ""),
+      onclick: () => {
+        if (state.table.sortCol === c) state.table.sortDir = state.table.sortDir === "asc" ? "desc" : "asc";
+        else {
+          state.table.sortCol = c;
+          state.table.sortDir = c === teamCol ? "asc" : "desc";
+        }
+        renderTable();
+      },
+    });
+    trh.append(th);
+  }
+  thead.append(trh);
+
+  const tbody = el("tbody");
+  for (const r of rows) {
+    const tr = el("tr");
+    for (const c of showCols) {
+      let v = r[c];
+      if (c === teamCol) {
+        const team = String(v ?? "").trim();
+        const a = el("a", { href: `#team=${encodeURIComponent(team)}`, html: escapeHtml(team) });
+        const td = el("td");
+        td.append(a);
+        tr.append(td);
+        continue;
+      }
+      if (v == null) v = "";
+      tr.append(el("td", { html: escapeHtml(v) }));
+    }
+    tbody.append(tr);
+  }
+
+  table.append(thead, tbody);
+}
+
+function renderTeam(teamId) {
+  const panel = $("#teamPanel");
+  panel.innerHTML = "";
+  const btnAdd = $("#btnAddToCompare");
+  btnAdd.disabled = !teamId;
+  if (!teamId) {
+    panel.append(el("div", { class: "pane", html: `<div class="muted">输入队号，然后点击“查看”。</div>` }));
+    return;
+  }
+
+  const row = state.rows.find((r) => String(r[state.teamCol] ?? "").trim() === String(teamId).trim());
+  if (!row) {
+    panel.append(el("div", { class: "pane", html: `<div class="muted">未找到队伍：<b>${escapeHtml(teamId)}</b></div>` }));
+    return;
+  }
+
+  const team = String(row[state.teamCol] ?? "").trim();
+  const score = state.stats.score.get(team) ?? "";
+  const rank = state.stats.rank.get(team) ?? "";
+
+  const statsPane = el("div", { class: "pane" }, [
+    el("div", { class: "pane-title", html: `队伍 <b>${escapeHtml(team)}</b>` }),
+    el("div", { class: "statrow" }, [
+      el("div", { class: "stat" }, [el("div", { class: "stat-k", html: "综合评分" }), el("div", { class: "stat-v", html: `${escapeHtml(score)}<small> /100</small>` })]),
+      el("div", { class: "stat" }, [el("div", { class: "stat-k", html: "排名（按评分）" }), el("div", { class: "stat-v", html: `${escapeHtml(rank)}` })]),
+      el("div", { class: "stat" }, [el("div", { class: "stat-k", html: "可对比指标数" }), el("div", { class: "stat-v", html: `${state.numericCols.length}` })]),
+      el("div", { class: "stat" }, [el("div", { class: "stat-k", html: "数据列数" }), el("div", { class: "stat-v", html: `${state.cols.length}` })]),
+    ]),
+  ]);
+
+  const metricCols =
+    (state.config.preferredMetricColumns || []).filter((c) => state.numericCols.includes(c)) ||
+    [];
+  const cols = metricCols.length ? metricCols : state.numericCols.slice(0, 10);
+
+  const bars = el("div", { class: "bars" });
+  for (const c of cols) {
+    const v = safeParseNumber(row[c]);
+    const min = state.stats.min.get(c);
+    const max = state.stats.max.get(c);
+    const t = v == null || min == null || max == null ? 0 : max === min ? 1 : (v - min) / (max - min);
+    const pct = Math.round(Math.max(0, Math.min(1, t)) * 100);
+    const bar = el("div", { class: "bar" }, [
+      el("div", { class: "bar-label", html: escapeHtml(c) }),
+      el("div", { class: "bar-track" }, [el("div", { class: "bar-fill", style: `width:${pct}%` })]),
+      el("div", { class: "bar-val", html: v == null ? "-" : escapeHtml(String(v)) }),
+    ]);
+    bars.append(bar);
+  }
+
+  const analysisPane = el("div", { class: "pane" }, [
+    el("div", { class: "pane-title", html: "指标概览（相对本表 min-max）" }),
+    bars,
+    el("div", { class: "hint muted", html: "这是一种简单的相对归一化：只适合 prescout 快速比较；后续可按你赛事规则自定义权重/阈值。" }),
+  ]);
+
+  const rawTable = el("table", { class: "table" });
+  const thead = el("thead");
+  thead.append(el("tr", {}, [el("th", { html: "字段" }), el("th", { html: "值" })]));
+  const tbody = el("tbody");
+  for (const c of state.cols) {
+    const v = row[c];
+    tbody.append(el("tr", {}, [el("td", { html: escapeHtml(c) }), el("td", { html: escapeHtml(v) })]));
+  }
+  rawTable.append(thead, tbody);
+  const rawPane = el("div", { class: "pane" }, [el("div", { class: "pane-title", html: "原始数据" }), el("div", { class: "scroll" }, [rawTable])]);
+
+  panel.append(statsPane, analysisPane, rawPane);
+
+  btnAdd.onclick = () => {
+    addCompare(team);
+    location.hash = `#compare=${encodeURIComponent([...state.compare].join(","))}`;
+  };
+}
+
+function addCompare(teamId) {
+  const t = String(teamId ?? "").trim();
+  if (!t) return;
+  if (state.compare.has(t)) return;
+  if (state.compare.size >= (state.config.maxCompareTeams || 4)) return;
+  state.compare.add(t);
+  renderCompareChips();
+  renderComparePanel();
+}
+
+function removeCompare(teamId) {
+  state.compare.delete(String(teamId));
+  renderCompareChips();
+  renderComparePanel();
+}
+
+function renderCompareChips() {
+  const wrap = $("#compareChips");
+  wrap.innerHTML = "";
+  for (const t of state.compare) {
+    wrap.append(
+      el("span", { class: "chip" }, [
+        el("span", { html: `队伍 <b>${escapeHtml(t)}</b>` }),
+        el("button", { title: "移除", onclick: () => removeCompare(t) }, [document.createTextNode("×")]),
+      ])
+    );
+  }
+  if (!state.compare.size) {
+    wrap.append(el("div", { class: "muted", html: "添加 2-4 支队伍开始对比。" }));
+  }
+}
+
+function renderComparePanel() {
+  const panel = $("#comparePanel");
+  panel.innerHTML = "";
+  const teams = [...state.compare];
+  if (teams.length < 2) {
+    panel.append(el("div", { class: "pane", html: `<div class="muted">至少选择 2 支队伍进行对比。</div>` }));
+    return;
+  }
+
+  const metricCols =
+    (state.config.preferredMetricColumns || []).filter((c) => state.numericCols.includes(c)) ||
+    [];
+  const cols = metricCols.length ? metricCols : state.numericCols.slice(0, 10);
+
+  // Compare table
+  const t = el("table", { class: "table" });
+  const thead = el("thead");
+  const trh = el("tr");
+  trh.append(el("th", { html: "指标" }));
+  for (const team of teams) trh.append(el("th", { html: `#${escapeHtml(team)}` }));
+  thead.append(trh);
+
+  const tbody = el("tbody");
+  for (const c of cols) {
+    const tr = el("tr");
+    tr.append(el("td", { html: escapeHtml(c) }));
+    for (const team of teams) {
+      const row = state.rows.find((r) => String(r[state.teamCol] ?? "").trim() === team);
+      const v = row ? row[c] : "";
+      tr.append(el("td", { html: escapeHtml(v) }));
+    }
+    tbody.append(tr);
+  }
+  t.append(thead, tbody);
+
+  // Score pane
+  const scoreBars = el("div", { class: "bars" });
+  const entries = teams
+    .map((team) => [team, state.stats.score.get(team) ?? 0])
+    .sort((a, b) => b[1] - a[1]);
+  const maxScore = Math.max(...entries.map(([, s]) => Number(s) || 0), 1);
+  for (const [team, sc] of entries) {
+    const pct = Math.round(((Number(sc) || 0) / maxScore) * 100);
+    scoreBars.append(
+      el("div", { class: "bar" }, [
+        el("div", { class: "bar-label", html: `综合评分 #${escapeHtml(team)}` }),
+        el("div", { class: "bar-track" }, [el("div", { class: "bar-fill", style: `width:${pct}%` })]),
+        el("div", { class: "bar-val", html: escapeHtml(String(sc)) }),
+      ])
+    );
+  }
+
+  panel.append(
+    el("div", { class: "pane" }, [el("div", { class: "pane-title", html: "对比总表" }), el("div", { class: "scroll" }, [t])]),
+    el("div", { class: "pane" }, [el("div", { class: "pane-title", html: "综合评分对比" }), scoreBars])
+  );
+}
+
+async function loadConfig() {
+  try {
+    const res = await fetch("./config.json", { cache: "no-store" });
+    if (!res.ok) throw new Error(`config.json HTTP ${res.status}`);
+    const cfg = await res.json();
+    state.config = { ...DEFAULT_CONFIG, ...cfg, ui: { ...DEFAULT_CONFIG.ui, ...(cfg.ui || {}) } };
+  } catch {
+    state.config = DEFAULT_CONFIG;
+  }
+  $("#configPreview").textContent = JSON.stringify(state.config, null, 2);
+}
+
+function rowsFromGrid(grid) {
+  if (!grid.length) return { rows: [], cols: [] };
+  const header = grid[0].map((h) => String(h ?? "").trim());
+  const cols = header.filter(Boolean);
+  const rows = [];
+  for (let i = 1; i < grid.length; i++) {
+    const rr = {};
+    const r = grid[i];
+    if (!r || !r.length) continue;
+    for (let j = 0; j < cols.length; j++) rr[cols[j]] = r[j] ?? "";
+    // Skip empty rows
+    if (Object.values(rr).every((v) => String(v ?? "").trim() === "")) continue;
+    rows.push(rr);
+  }
+  return { rows, cols };
+}
+
+async function loadDataFromPath() {
+  const path = state.config.dataPath || DEFAULT_CONFIG.dataPath;
+  state.source = { kind: "path", label: path };
+  const res = await fetch(path, { cache: "no-store" });
+  if (!res.ok) throw new Error(`data HTTP ${res.status}: ${path}`);
+  const text = await res.text();
+  const grid = parseCSV(text);
+  return rowsFromGrid(grid);
+}
+
+async function loadSamplePreview() {
+  try {
+    const res = await fetch("./data/prescout.sample.csv", { cache: "no-store" });
+    if (!res.ok) return;
+    const text = await res.text();
+    $("#samplePreview").textContent = text.trim();
+  } catch {
+    // ignore
+  }
+}
+
+function setModel({ rows, cols }) {
+  state.rows = rows;
+  state.cols = cols;
+  state.teamCol = pickTeamColumn(cols, state.config.teamIdColumnCandidates || DEFAULT_CONFIG.teamIdColumnCandidates);
+  state.numericCols = inferNumericColumns(rows, cols).filter((c) => c !== state.teamCol);
+  computeStats();
+}
+
+function wireUI() {
+  $("#tableSearch").addEventListener("input", (e) => {
+    state.table.query = e.target.value || "";
+    renderTable();
+  });
+  $("#btnReload").addEventListener("click", async () => {
+    await boot({ force: true });
+  });
+  $("#btnGoTeam").addEventListener("click", () => {
+    const team = ($("#teamQuery").value || "").trim();
+    location.hash = `#team=${encodeURIComponent(team)}`;
+  });
+  $("#teamQuery").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") $("#btnGoTeam").click();
+  });
+
+  $("#compareAdd").addEventListener("keydown", (e) => {
+    if (e.key !== "Enter") return;
+    const team = (e.target.value || "").trim();
+    e.target.value = "";
+    addCompare(team);
+    location.hash = `#compare=${encodeURIComponent([...state.compare].join(","))}`;
+  });
+  $("#btnClearCompare").addEventListener("click", () => {
+    state.compare.clear();
+    renderCompareChips();
+    renderComparePanel();
+    location.hash = "#compare";
+  });
+  $("#btnShareLink").addEventListener("click", async () => {
+    const hash = `#compare=${encodeURIComponent([...state.compare].join(","))}`;
+    const url = `${location.origin}${location.pathname}${hash}`;
+    try {
+      await navigator.clipboard.writeText(url);
+      showStatus("已复制对比链接到剪贴板。");
+      setTimeout(() => showStatus(""), 1200);
+    } catch {
+      showStatus("复制失败：浏览器不允许剪贴板。你可以手动复制地址栏链接。");
+    }
+  });
+
+  $("#fileInput").addEventListener("change", async (e) => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    const text = await f.text();
+    const grid = parseCSV(text);
+    const model = rowsFromGrid(grid);
+    setModel(model);
+    showStatus(`已从上传文件载入：${f.name}（${model.rows.length} 行）`);
+    // Re-render current view
+    onRoute();
+  });
+
+  window.addEventListener("hashchange", onRoute);
+}
+
+function onRoute() {
+  const r = parseHash();
+  showView(r.view);
+
+  $("#viewTable").hidden = false; // ensure sections exist for render calls below
+  $("#viewTeam").hidden = false;
+  $("#viewCompare").hidden = false;
+  $("#viewImport").hidden = false;
+
+  // Apply compare list from URL if provided
+  if (r.view === "compare") {
+    state.compare.clear();
+    for (const t of r.compare) addCompare(t);
+  }
+
+  if (r.view === "table") {
+    renderTable();
+  } else if (r.view === "team") {
+    if (r.team != null) $("#teamQuery").value = r.team;
+    renderTeam(r.team);
+  } else if (r.view === "compare") {
+    renderCompareChips();
+    renderComparePanel();
+  } else if (r.view === "import") {
+    // just show previews
+  }
+
+  // Finally hide non-active views.
+  showView(r.view);
+}
+
+async function boot({ force = false } = {}) {
+  showStatus("");
+  await loadConfig();
+  await loadSamplePreview();
+
+  try {
+    const model = await loadDataFromPath();
+    setModel(model);
+    $("#viewTable").hidden = false;
+    $("#viewTeam").hidden = false;
+    $("#viewCompare").hidden = false;
+    $("#viewImport").hidden = false;
+    showStatus(`已加载：${state.source.label}（${state.rows.length} 行，队号列：${state.teamCol}）`);
+  } catch (err) {
+    // If opened via file://, fetch will often fail. Provide a clear hint.
+    const hint =
+      location.protocol === "file:"
+        ? "你正在用 file:// 打开页面，浏览器会拦截 fetch。本地预览请用本地静态服务器（或直接部署到 GitHub Pages）。"
+        : "请确认 `config.json` 的 dataPath 指向可访问的 CSV。";
+    showStatus(`数据加载失败：${String(err?.message || err)}。${hint}`);
+    // Still show import view so user can upload CSV.
+    showView("import");
+  }
+
+  if (force) {
+    const r = parseHash();
+    location.hash = `#${r.view}`;
+  }
+  onRoute();
+}
+
+wireUI();
+boot();

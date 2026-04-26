@@ -1,0 +1,9 @@
+{
+  "dataPath": "./data/prescout.csv",
+  "teamIdColumnCandidates": ["Team", "team", "队号", "队伍", "队伍编号", "Team Number", "TeamNumber"],
+  "preferredMetricColumns": [],
+  "maxCompareTeams": 4,
+  "ui": {
+    "defaultView": "table"
+  }
+}
